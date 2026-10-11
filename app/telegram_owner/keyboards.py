@@ -7,6 +7,11 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 حالة النظام", callback_data="menu:status")],
         [InlineKeyboardButton("🏢 الشركات والمكاتب", callback_data="menu:companies")],
         [InlineKeyboardButton("📋 الخطط المعلقة", callback_data="menu:plans")],
+        [InlineKeyboardButton("🌴 طلبات الإجازة", callback_data="menu:leaves")],
+        [InlineKeyboardButton("💰 المالية", callback_data="menu:finance")],
+        [InlineKeyboardButton("📈 التقارير", callback_data="menu:reports")],
+        [InlineKeyboardButton("💊 المنتجات", callback_data="menu:products")],
+        [InlineKeyboardButton("📝 الاستبيانات", callback_data="menu:surveys")],
         [InlineKeyboardButton("👥 المستخدمون", callback_data="menu:users:0")],
         [InlineKeyboardButton("🔍 بحث عن مندوب", callback_data="menu:search_rep")],
         [InlineKeyboardButton("📝 سجل التدقيق", callback_data="menu:audit:0")],
@@ -21,10 +26,13 @@ def confirm_keyboard(yes_data: str, back_data: str) -> InlineKeyboardMarkup:
     ])
 
 
-def plan_review_keyboard(plan_type: str, plan_id: int) -> InlineKeyboardMarkup:
+def plan_review_keyboard(plan_type: str, plan_id: int,
+                         office_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ اعتماد", callback_data=f"act:plan_approve:{plan_type}:{plan_id}")],
-        [InlineKeyboardButton("✏️ إرجاع للتعديل", callback_data=f"act:plan_return:{plan_type}:{plan_id}")],
+        [InlineKeyboardButton("✅ اعتماد",
+                              callback_data=f"act:plan_approve:{plan_type}:{plan_id}:{office_id}")],
+        [InlineKeyboardButton("✏️ إرجاع للتعديل",
+                              callback_data=f"act:plan_return:{plan_type}:{plan_id}:{office_id}")],
         [InlineKeyboardButton("◀️ الخطط المعلقة", callback_data="menu:plans")],
     ])
 
@@ -57,6 +65,54 @@ def back_to_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("◀️ القائمة الرئيسية", callback_data="menu:main")]
     ])
+
+
+def leave_review_keyboard(office_id: int, request_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ اعتماد الإجازة",
+                              callback_data=f"act:leave_approve:{office_id}:{request_id}")],
+        [InlineKeyboardButton("❌ رفض الإجازة",
+                              callback_data=f"act:leave_reject:{office_id}:{request_id}")],
+        [InlineKeyboardButton("◀️ طلبات الإجازة", callback_data="menu:leaves")],
+    ])
+
+
+def deduct_review_keyboard(office_id: int, txn_uuid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ اعتماد الخصم",
+                              callback_data=f"act:deduct_approve:{office_id}:{txn_uuid}")],
+        [InlineKeyboardButton("❌ رفض الخصم",
+                              callback_data=f"act:deduct_reject:{office_id}:{txn_uuid}")],
+        [InlineKeyboardButton("◀️ الخصومات المقترحة", callback_data="menu:deducts")],
+    ])
+
+
+def product_detail_keyboard(office_id: int, product_id: int,
+                            is_active: bool) -> InlineKeyboardMarkup:
+    toggle = "⏸️ تعطيل" if is_active else "▶️ تفعيل"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle,
+                              callback_data=f"act:product_toggle:{office_id}:{product_id}")],
+        [InlineKeyboardButton("◀️ المنتجات",
+                              callback_data=f"menu:products_off:{office_id}")],
+    ])
+
+
+def survey_detail_keyboard(office_id: int, survey_id: int,
+                           status: str) -> InlineKeyboardMarkup:
+    rows = []
+    if status == "draft":
+        rows.append([InlineKeyboardButton(
+            "▶️ تفعيل", callback_data=f"act:survey_activate:{office_id}:{survey_id}")])
+    elif status == "active":
+        rows.append([InlineKeyboardButton(
+            "⏹️ إغلاق", callback_data=f"act:survey_close:{office_id}:{survey_id}")])
+    rows.append([InlineKeyboardButton(
+        "📊 عرض النتائج",
+        callback_data=f"menu:survey_results:{office_id}:{survey_id}")])
+    rows.append([InlineKeyboardButton(
+        "◀️ الاستبيانات", callback_data=f"menu:surveys_off:{office_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def companies_list(companies) -> InlineKeyboardMarkup:

@@ -21,6 +21,7 @@ from app.core.time_utils import ensure_utc, utcnow
 from app.databases import manager as dbm
 from app.databases import office_models as om
 from app.identity import models as im
+from app.services import attachments as attach_svc
 from app.services.audit import log_office_event
 
 
@@ -168,8 +169,129 @@ def list_actual_visits(data_dir: Path, actor: int, *, office_id: int,
                 for v in q.limit(limit).all()]
 
 
+def get_actual_visit(data_dir: Path, actor: int, *, office_id: int,
+                     visit_id: int) -> dict:
+    """Full visit detail including its (non-deleted) attachments."""
+    with dbm.identity_session(data_dir) as s:
+        try:
+            require_permission(s, actor, "visit.correct", office_id=office_id)
+            rep_filter = None
+        except PermissionDenied:
+            require_permission(s, actor, "visit.record", office_id=office_id)
+            rep_filter = actor
+    with dbm.office_session(data_dir, office_id) as osess:
+        v = osess.get(om.ActualVisit, visit_id)
+        if v is None:
+            raise NotFound("visit not found")
+        if rep_filter is not None and v.representative_id != rep_filter:
+            raise PermissionDenied("can only view own visits")
+        atts = (osess.query(om.Attachment)
+                .filter_by(owner_type="visit", owner_id=v.id, deleted=False)
+                .order_by(om.Attachment.id).all())
+        return {
+            "visit_id": v.id, "rep": v.representative_id,
+            "target_type": v.target_type, "target_id": v.target_id,
+            "visited_at": v.visited_at.isoformat(),
+            "visit_type": v.visit_type, "outcome": v.outcome,
+            "notes": v.notes,
+            "products": json.loads(v.products_json or "[]"),
+            "status": v.status,
+            "attachments": [attach_svc._to_dict(a) for a in atts],
+        }
+
+
 def _require_target(osess: Session, target_type: str, target_id: int) -> None:
     model = om.Doctor if target_type == "doctor" else om.Pharmacy
     target = osess.get(model, int(target_id))
     if target is None or target.status != "active":
         raise NotFound(f"{target_type} not found or inactive")
+
+
+def _validate_catalog_product(osess: Session, product_id: int) -> om.Product:
+    """Product must exist in THIS office DB and be active."""
+    p = osess.get(om.Product, product_id)
+    if p is None:
+        raise NotFound(f"product {product_id} not found in this office")
+    if p.status != "active":
+        raise ValidationError(f"product {product_id} is not active")
+    return p
+
+
+def record_visit_products(data_dir: Path, actor: int, *, office_id: int,
+                          visit_id: int, items: list[dict]) -> dict:
+    """Link catalog products to a recorded visit.
+
+    items: [{"product_id": int, "quantity": int}]. Each product must exist in
+    this office and be active. Structured rows go to visit_products; a
+    structured mirror is merged into products_json while legacy free-text
+    entries are preserved untouched.
+    """
+    if not items:
+        raise ValidationError("at least one product is required")
+    with dbm.office_session(data_dir, office_id) as osess:
+        v = osess.get(om.ActualVisit, visit_id)
+        if v is None:
+            raise NotFound("visit not found")
+        rep_id = v.representative_id
+    with dbm.identity_session(data_dir) as s:
+        _require_self_or_manager(s, actor, office_id, rep_id,
+                                 "visit.record", "visit.correct")
+    with dbm.office_session(data_dir, office_id) as osess:
+        v = osess.get(om.ActualVisit, visit_id)
+        linked: list[dict] = []
+        for it in items:
+            try:
+                pid = int(it["product_id"])
+            except (KeyError, TypeError, ValueError):
+                raise ValidationError("each item needs an integer product_id")
+            qty = it.get("quantity", 1)
+            if not isinstance(qty, int) or qty < 1:
+                raise ValidationError("quantity must be a positive integer")
+            p = _validate_catalog_product(osess, pid)
+            row = (osess.query(om.VisitProduct)
+                   .filter_by(visit_id=visit_id, product_id=pid).first())
+            if row is None:
+                row = om.VisitProduct(visit_id=visit_id, product_id=pid,
+                                      quantity=qty, added_by=actor)
+                osess.add(row)
+            else:
+                row.quantity = qty
+            linked.append({"product_id": pid, "trade_name": p.trade_name,
+                           "quantity": qty})
+        # mirror into products_json: keep legacy entries, replace structured
+        # ones for the same product ids
+        try:
+            legacy = json.loads(v.products_json or "[]")
+            if not isinstance(legacy, list):
+                legacy = []
+        except (json.JSONDecodeError, TypeError):
+            legacy = []
+        pids = {e["product_id"] for e in linked}
+        kept = [e for e in legacy
+                if not (isinstance(e, dict) and e.get("product_id") in pids)]
+        v.products_json = json.dumps(kept + linked, ensure_ascii=False)
+        osess.flush()
+        log_office_event(osess, actor_user_id=actor,
+                         event_type="VISIT_PRODUCTS_RECORDED",
+                         entity="actual_visit", entity_id=visit_id)
+        return {"visit_id": visit_id, "products": linked}
+
+
+def list_visit_products(data_dir: Path, actor: int, *, office_id: int,
+                        visit_id: int) -> list[dict]:
+    """Structured catalog products linked to a visit."""
+    with dbm.identity_session(data_dir) as s:
+        try:
+            require_permission(s, actor, "visit.correct", office_id=office_id)
+        except PermissionDenied:
+            require_permission(s, actor, "visit.record", office_id=office_id)
+    with dbm.office_session(data_dir, office_id) as osess:
+        v = osess.get(om.ActualVisit, visit_id)
+        if v is None:
+            raise NotFound("visit not found")
+        rows = (osess.query(om.VisitProduct, om.Product)
+                .join(om.Product, om.VisitProduct.product_id == om.Product.id)
+                .filter(om.VisitProduct.visit_id == visit_id)
+                .order_by(om.VisitProduct.id).all())
+        return [{"product_id": p.id, "trade_name": p.trade_name,
+                 "quantity": vp.quantity} for vp, p in rows]

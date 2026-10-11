@@ -21,6 +21,11 @@ from app.identity import models as im
 from app.identity import services as identity_svc
 from app.services import plans as plans_svc
 from app.services import representatives as rep_svc
+from app.services import leave as leave_svc
+from app.services import payroll as payroll_svc
+from app.services import reports as reports_svc
+from app.services import products as products_svc
+from app.services import surveys as surveys_svc
 from app.telegram_owner import auth, formatting, keyboards
 from app.telegram_owner.formatting import PAGE_SIZE
 
@@ -44,6 +49,20 @@ async def _reply(update: Update, text: str, keyboard=None) -> None:
     elif update.message:
         await update.message.reply_text(
             text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def _reply_document(update: Update, path: Path, filename: str) -> None:
+    """Send a generated file (e.g. Excel export) as a Telegram document."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+        if msg is not None:
+            with open(path, "rb") as f:
+                await msg.reply_document(document=f, filename=filename)
+            return
+    if update.message:
+        with open(path, "rb") as f:
+            await update.message.reply_document(document=f, filename=filename)
 
 
 def _guarded(fn):
@@ -206,9 +225,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, actor:
     data_dir: Path = context.bot_data["data_dir"]
     parts = data.split(":")
 
-    # Phase 7 write actions (each re-checks permission inside the service).
-    if data.startswith("menu:plans") or data.startswith("menu:plan:") \
-            or data.startswith("act:"):
+    # Write menus + write actions (each re-checks permission in the service).
+    _write_menu_prefixes = (
+        "menu:plans", "menu:plan:",
+        "menu:leaves", "menu:leave:",
+        "menu:finance", "menu:deduct", "menu:salary",
+        "menu:reports", "menu:report",
+        "menu:products", "menu:product",
+        "menu:surveys", "menu:survey:", "menu:survey_results",
+    )
+    if data.startswith("act:") or data.startswith(_write_menu_prefixes):
         if await handle_write_callback(update, context, actor, data_dir,
                                         parts, data):
             return
@@ -405,7 +431,7 @@ async def _show_plan_detail(update, data_dir: Path, actor: int,
              f"الفترة: {plan['period']}",
              f"الحالة: {plan['status']} — الإصدار {plan['version']}"]
     await _reply(update, "\n".join(lines),
-                 keyboards.plan_review_keyboard(plan_type, plan_id))
+                 keyboards.plan_review_keyboard(plan_type, plan_id, office_id))
 
 
 async def _flow_text(update, context, actor: int, flow: dict):
@@ -492,6 +518,44 @@ async def _flow_text(update, context, actor: int, flow: dict):
             offices = s.query(im.Office).order_by(im.Office.id).all()
         await _reply(update, "اختر المكتب:",
                      keyboards.offices_pick("act:user_off", offices))
+
+    elif kind == "leave_reject" and step == "notes":
+        fdata["notes"] = text
+        _stash_pending(context, "pending_leave_reject", fdata)
+        oid, rid = fdata["oid"], fdata["rid"]
+        await _reply(
+            update,
+            f"❌ رفض طلب الإجازة؟\nالسبب: {text or '—'}",
+            keyboards.confirm_keyboard(
+                f"act:leave_reject_yes:{oid}:{rid}",
+                f"menu:leave:{oid}:{rid}"))
+
+    elif kind == "deduct_reject" and step == "notes":
+        fdata["notes"] = text
+        _stash_pending(context, "pending_deduct_reject", fdata)
+        oid, uuid = fdata["oid"], fdata["uuid"]
+        await _reply(
+            update,
+            f"❌ رفض الخصم المقترح؟\nالسبب: {text or '—'}",
+            keyboards.confirm_keyboard(
+                f"act:deduct_reject_yes:{oid}:{uuid}",
+                f"menu:deduct:{oid}:{uuid}"))
+
+    elif kind == "product_add" and step == "trade_name":
+        fdata["trade_name"] = text
+        flow["step"] = "scientific"
+        await _reply(update, "أرسل الاسم العلمي (أو — للتخطي):",
+                     keyboards.back_to_main())
+
+    elif kind == "product_add" and step == "scientific":
+        fdata["scientific_name"] = "" if text == "—" else text
+        _stash_pending(context, "pending_product", fdata)
+        await _reply(
+            update,
+            f"💊 إنشاء منتج *{fdata['trade_name']}*؟",
+            keyboards.confirm_keyboard(
+                f"act:product_add_yes:{fdata['oid']}",
+                f"menu:products_off:{fdata['oid']}"))
 
     else:
         context.user_data.pop("flow", None)
@@ -643,6 +707,554 @@ async def handle_write_callback(update, context, actor: int,
             data_dir, actor, rep_user_id=uid, from_office_id=oid,
             to_office_id=to_oid, new_employee_code=code, reason="عبر البوت")
         await _reply(update, "🔀 تم النقل بنجاح.", keyboards.back_to_main())
+        return True
+
+    # ---- leaves ----
+    if data == "menu:leaves":
+        rows = []
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        for o in offices:
+            try:
+                reqs = leave_svc.list_leave_requests(
+                    data_dir, actor, office_id=o.id, status="pending")
+            except (PermissionDenied, DomainError):
+                continue
+            mark = f" ({len(reqs)} معلقة)" if reqs else ""
+            rows.append([InlineKeyboardButton(
+                f"🏬 {o.name_ar}{mark}",
+                callback_data=f"menu:leaves_off:{o.id}")])
+        rows.append([InlineKeyboardButton("◀️ القائمة الرئيسية",
+                                          callback_data="menu:main")])
+        await _reply(update, "🌴 *طلبات الإجازة المعلقة* — اختر المكتب:",
+                     InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "leaves_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        reqs = leave_svc.list_leave_requests(
+            data_dir, actor, office_id=oid, status="pending")
+        rows = []
+        for r in reqs:
+            name = _user_name(data_dir, r["rep"])
+            rows.append([InlineKeyboardButton(
+                f"{name} — {r['period']} ({r['days']} أيام)",
+                callback_data=f"menu:leave:{oid}:{r['request_id']}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("لا توجد طلبات معلقة",
+                                              callback_data="menu:leaves")])
+        rows.append([InlineKeyboardButton("◀️ طلبات الإجازة",
+                                          callback_data="menu:leaves")])
+        await _reply(update, "🌴 الطلبات المعلقة:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "leave"] and len(parts) == 4:
+        oid, rid = int(parts[2]), int(parts[3])
+        with dbm.office_session(data_dir, oid) as osess:
+            req = osess.get(om.LeaveRequest, rid)
+            if req is None:
+                raise DomainError("طلب الإجازة غير موجود")
+            ltype = osess.get(om.LeaveType, req.leave_type_id)
+        name = _user_name(data_dir, req.representative_id)
+        lines = ["🌴 *طلب إجازة*",
+                 f"المندوب: {name}",
+                 f"النوع: {ltype.name if ltype else '—'}",
+                 f"الفترة: {req.start_date} ← {req.end_date} ({req.days_count} أيام)",
+                 f"السبب: {req.reason or '—'}",
+                 f"الحالة: {req.status}"]
+        kb = (keyboards.leave_review_keyboard(oid, rid)
+              if req.status == "pending" else keyboards.back_to_main())
+        await _reply(update, "\n".join(lines), kb)
+        return True
+
+    if parts[:2] == ["act", "leave_approve"] and len(parts) == 4:
+        oid, rid = int(parts[2]), int(parts[3])
+        await _reply(update, "✅ اعتماد طلب الإجازة؟",
+                     keyboards.confirm_keyboard(
+                         f"act:leave_approve_yes:{oid}:{rid}",
+                         f"menu:leave:{oid}:{rid}"))
+        return True
+
+    if parts[:2] == ["act", "leave_approve_yes"] and len(parts) == 4:
+        oid, rid = int(parts[2]), int(parts[3])
+        out = leave_svc.review_leave(data_dir, actor, office_id=oid,
+                                     request_id=rid, decision="approve",
+                                     notes="اعتماد عبر البوت")
+        await _reply(update, f"✅ تم اعتماد الإجازة ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "leave_reject"] and len(parts) == 4:
+        oid, rid = int(parts[2]), int(parts[3])
+        _set_flow(context, "leave_reject", "notes", {"oid": oid, "rid": rid})
+        await _reply(update, "❌ أرسل سبب الرفض:",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "leave_reject_yes"] and len(parts) == 4:
+        oid, rid = int(parts[2]), int(parts[3])
+        pending = context.user_data.pop("pending_leave_reject", None) or {}
+        out = leave_svc.review_leave(data_dir, actor, office_id=oid,
+                                     request_id=rid, decision="reject",
+                                     notes=pending.get("notes", ""))
+        await _reply(update, f"❌ تم رفض طلب الإجازة ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    # ---- finance ----
+    if data == "menu:finance":
+        await _reply(update, "💰 *المالية* — اختر:",
+                     InlineKeyboardMarkup([
+                         [InlineKeyboardButton(
+                             "📋 الخصومات المقترحة",
+                             callback_data="menu:deducts")],
+                         [InlineKeyboardButton(
+                             "🧾 ملخص راتب مندوب",
+                             callback_data="menu:salary")],
+                         [InlineKeyboardButton(
+                             "◀️ القائمة الرئيسية",
+                             callback_data="menu:main")],
+                     ]))
+        return True
+
+    if data == "menu:deducts":
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        await _reply(update, "📋 اختر المكتب:",
+                     keyboards.offices_pick("menu:deducts_off", offices))
+        return True
+
+    if parts[:2] == ["menu", "deducts_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        txns = payroll_svc.list_transactions(
+            data_dir, actor, office_id=oid, status="pending")
+        rows = []
+        for t in [x for x in txns if x["kind"] == "deduction_proposed"]:
+            name = _user_name(data_dir, t["rep"])
+            rows.append([InlineKeyboardButton(
+                f"{name} — {abs(t['amount']):,} د.ع. — {t['reason'][:20]}",
+                callback_data=f"menu:deduct:{oid}:{t['uuid']}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("لا توجد خصومات معلقة",
+                                              callback_data="menu:deducts")])
+        rows.append([InlineKeyboardButton("◀️ المالية",
+                                          callback_data="menu:finance")])
+        await _reply(update, "📋 الخصومات المقترحة المعلقة:",
+                     InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "deduct"] and len(parts) == 4:
+        oid, uuid = int(parts[2]), parts[3]
+        txns = payroll_svc.list_transactions(data_dir, actor, office_id=oid)
+        t = next((x for x in txns if x["uuid"] == uuid), None)
+        if t is None:
+            raise DomainError("الخصم غير موجود")
+        name = _user_name(data_dir, t["rep"])
+        lines = ["📋 *خصم مقترح*",
+                 f"المندوب: {name}",
+                 f"المبلغ: {abs(t['amount']):,} د.ع.",
+                 f"السبب: {t['reason'] or '—'}",
+                 f"الحالة: {t['status']}"]
+        kb = (keyboards.deduct_review_keyboard(oid, uuid)
+              if t["status"] == "pending" else keyboards.back_to_main())
+        await _reply(update, "\n".join(lines), kb)
+        return True
+
+    if parts[:2] == ["act", "deduct_approve"] and len(parts) == 4:
+        oid, uuid = int(parts[2]), parts[3]
+        await _reply(update, "✅ اعتماد هذا الخصم؟ _سيُطبق فورًا._",
+                     keyboards.confirm_keyboard(
+                         f"act:deduct_approve_yes:{oid}:{uuid}",
+                         f"menu:deduct:{oid}:{uuid}"))
+        return True
+
+    if parts[:2] == ["act", "deduct_approve_yes"] and len(parts) == 4:
+        oid, uuid = int(parts[2]), parts[3]
+        out = payroll_svc.review_proposed_deduction(
+            data_dir, actor, office_id=oid, txn_uuid=uuid,
+            decision="approve", notes="اعتماد عبر البوت")
+        await _reply(update, f"✅ تم اعتماد الخصم ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "deduct_reject"] and len(parts) == 4:
+        oid, uuid = int(parts[2]), parts[3]
+        _set_flow(context, "deduct_reject", "notes",
+                   {"oid": oid, "uuid": uuid})
+        await _reply(update, "❌ أرسل سبب الرفض:",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "deduct_reject_yes"] and len(parts) == 4:
+        oid, uuid = int(parts[2]), parts[3]
+        pending = context.user_data.pop("pending_deduct_reject", None) or {}
+        out = payroll_svc.review_proposed_deduction(
+            data_dir, actor, office_id=oid, txn_uuid=uuid,
+            decision="reject", notes=pending.get("notes", ""))
+        await _reply(update, f"❌ تم رفض الخصم ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    if data == "menu:salary":
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        await _reply(update, "🧾 اختر المكتب:",
+                     keyboards.offices_pick("menu:salary_off", offices))
+        return True
+
+    if parts[:2] == ["menu", "salary_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        reps, names, _ = _reps_page(data_dir, oid, 0)
+        rows = [[InlineKeyboardButton(
+            f"🩺 {names.get(r.user_id, '?')} — {r.employee_code}",
+            callback_data=f"menu:salary_rep:{oid}:{r.user_id}")]
+            for r in reps]
+        if not rows:
+            rows.append([InlineKeyboardButton("لا يوجد مندوبون",
+                                              callback_data="menu:salary")])
+        rows.append([InlineKeyboardButton("◀️ المالية",
+                                          callback_data="menu:finance")])
+        await _reply(update, "🧾 اختر المندوب:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "salary_rep"] and len(parts) == 4:
+        oid, uid = int(parts[2]), int(parts[3])
+        with dbm.office_session(data_dir, oid) as osess:
+            periods = (osess.query(om.PayrollPeriod)
+                       .order_by(om.PayrollPeriod.id.desc()).limit(12).all())
+        rows = [[InlineKeyboardButton(
+            f"🗓️ {p.name} ({p.status})",
+            callback_data=f"menu:salary_view:{oid}:{uid}:{p.id}")]
+            for p in periods]
+        if not rows:
+            rows.append([InlineKeyboardButton("لا توجد فترات",
+                                              callback_data=f"menu:salary_off:{oid}")])
+        rows.append([InlineKeyboardButton("◀️ المندوبون",
+                                          callback_data=f"menu:salary_off:{oid}")])
+        await _reply(update, "🗓️ اختر الفترة:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "salary_view"] and len(parts) == 5:
+        oid, uid, pid = int(parts[2]), int(parts[3]), int(parts[4])
+        summ = payroll_svc.salary_summary(data_dir, actor, office_id=oid,
+                                          rep_user_id=uid, period_id=pid)
+        name = _user_name(data_dir, uid)
+        lines = [f"🧾 *ملخص الراتب — {name}*",
+                 f"الفترة: {summ['period']} ({summ['status']})",
+                 f"الراتب الأساسي: {summ['base_salary']:,} د.ع.",
+                 f"المكافآت: {summ['bonuses']:,} د.ع.",
+                 f"الاستقطاعات: {summ['deductions']:,} د.ع.",
+                 f"*الصافي: {summ['net']:,} د.ع.*"]
+        await _reply(update, "\n".join(lines), keyboards.back_to_main())
+        return True
+
+    # ---- reports ----
+    if data == "menu:reports":
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        await _reply(update, "📈 اختر المكتب:",
+                     keyboards.offices_pick("menu:reports_off", offices))
+        return True
+
+    if parts[:2] == ["menu", "reports_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        await _reply(update, "📈 *التقارير* — اختر:",
+                     InlineKeyboardMarkup([
+                         [InlineKeyboardButton(
+                             "📅 التقرير اليومي (اليوم)",
+                             callback_data=f"menu:report_daily:{oid}")],
+                         [InlineKeyboardButton(
+                             "🗓️ التقرير الأسبوعي (هذا الأسبوع)",
+                             callback_data=f"menu:report_weekly:{oid}")],
+                         [InlineKeyboardButton(
+                             "🏅 أداء مندوب (آخر 30 يومًا)",
+                             callback_data=f"menu:report_perf_pick:{oid}")],
+                         [InlineKeyboardButton(
+                             "◀️ التقارير", callback_data="menu:reports")],
+                     ]))
+        return True
+
+    if parts[:2] == ["menu", "report_daily"] and len(parts) == 3:
+        oid = int(parts[2])
+        from datetime import date
+        day = date.today().isoformat()
+        rep = reports_svc.daily_report(data_dir, actor, office_id=oid, day=day)
+        t = rep["totals"]
+        lines = [f"📅 *{rep['title']}*",
+                 f"المندوبون: {t['reps']}",
+                 f"الزيارات: {t['visits']}",
+                 f"الحاضرون: {t['present']}"]
+        rows = [[InlineKeyboardButton(
+            "⬇️ تنزيل Excel",
+            callback_data=f"act:report_xlsx:daily:{oid}:{day}")],
+            [InlineKeyboardButton("◀️ التقارير",
+                                  callback_data=f"menu:reports_off:{oid}")]]
+        await _reply(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "report_weekly"] and len(parts) == 3:
+        oid = int(parts[2])
+        from datetime import date, timedelta
+        monday = (date.today() -
+                  timedelta(days=date.today().weekday())).isoformat()
+        rep = reports_svc.weekly_report(data_dir, actor, office_id=oid,
+                                        week_start=monday)
+        t = rep["totals"]
+        lines = [f"🗓️ *{rep['title']}*",
+                 f"المندوبون: {t['reps']}",
+                 f"الزيارات: {t['visits']}"]
+        rows = [[InlineKeyboardButton(
+            "⬇️ تنزيل Excel",
+            callback_data=f"act:report_xlsx:weekly:{oid}:{monday}")],
+            [InlineKeyboardButton("◀️ التقارير",
+                                  callback_data=f"menu:reports_off:{oid}")]]
+        await _reply(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "report_perf_pick"] and len(parts) == 3:
+        oid = int(parts[2])
+        reps, names, _ = _reps_page(data_dir, oid, 0)
+        rows = [[InlineKeyboardButton(
+            f"🩺 {names.get(r.user_id, '?')} — {r.employee_code}",
+            callback_data=f"menu:report_perf:{oid}:{r.user_id}")]
+            for r in reps]
+        if not rows:
+            rows.append([InlineKeyboardButton(
+                "لا يوجد مندوبون", callback_data=f"menu:reports_off:{oid}")])
+        rows.append([InlineKeyboardButton(
+            "◀️ التقارير", callback_data=f"menu:reports_off:{oid}")])
+        await _reply(update, "🏅 اختر المندوب:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "report_perf"] and len(parts) == 4:
+        oid, uid = int(parts[2]), int(parts[3])
+        from datetime import date, timedelta
+        end = date.today().isoformat()
+        start = (date.today() - timedelta(days=30)).isoformat()
+        rep = reports_svc.rep_performance(data_dir, actor, office_id=oid,
+                                          rep_user_id=uid,
+                                          start_date=start, end_date=end)
+        row = rep["rows"][0]
+        name = _user_name(data_dir, uid)
+        lines = [f"🏅 *أداء {name}* ({start} ← {end})",
+                 f"الزيارات: {row['visits']} (منجزة: {row['visits_done']})",
+                 f"أيام الحضور: {row['days_present']}",
+                 f"دقائق التأخير: {row['total_late_minutes']}",
+                 f"المكافآت: {row['bonuses']:,} د.ع.",
+                 f"الاستقطاعات: {row['deductions']:,} د.ع."]
+        xlsx_cb = f"act:report_xlsx:perf:{oid}:{uid}"
+        rows = [[InlineKeyboardButton("⬇️ تنزيل Excel",
+                                      callback_data=xlsx_cb)],
+                [InlineKeyboardButton("◀️ التقارير",
+                                      callback_data=f"menu:reports_off:{oid}")]]
+        context.user_data["perf_range"] = {"start": start, "end": end}
+        await _reply(update, "\n".join(lines), InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["act", "report_xlsx"] and len(parts) >= 5:
+        kind, oid = parts[2], int(parts[3])
+        import tempfile
+        from datetime import date, timedelta
+        if kind == "daily":
+            day = parts[4]
+            rep = reports_svc.daily_report(data_dir, actor, office_id=oid,
+                                           day=day)
+            fname = f"daily_{oid}_{day}.xlsx"
+        elif kind == "weekly":
+            monday = parts[4]
+            rep = reports_svc.weekly_report(data_dir, actor, office_id=oid,
+                                            week_start=monday)
+            fname = f"weekly_{oid}_{monday}.xlsx"
+        else:  # perf
+            uid = int(parts[4])
+            pr = context.user_data.get("perf_range") or {}
+            end = pr.get("end", date.today().isoformat())
+            start = pr.get("start",
+                           (date.today() - timedelta(days=30)).isoformat())
+            rep = reports_svc.rep_performance(data_dir, actor, office_id=oid,
+                                              rep_user_id=uid,
+                                              start_date=start, end_date=end)
+            fname = f"perf_{oid}_{uid}_{start}_{end}.xlsx"
+        tmp = Path(tempfile.mkdtemp(prefix="medrep_xlsx_")) / fname
+        reports_svc.export_excel(rep, tmp)
+        await _reply_document(update, tmp, fname)
+        return True
+
+    # ---- products ----
+    if data == "menu:products":
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        await _reply(update, "💊 اختر المكتب:",
+                     keyboards.offices_pick("menu:products_off", offices))
+        return True
+
+    if parts[:2] == ["menu", "products_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        prods = products_svc.list_products(data_dir, actor, office_id=oid,
+                                           active_only=False)
+        rows = []
+        for p in prods[:20]:
+            mark = "✅" if p["status"] == "active" else "⏸️"
+            rows.append([InlineKeyboardButton(
+                f"{mark} {p['trade_name']}",
+                callback_data=f"menu:product:{oid}:{p['id']}")])
+        rows.append([InlineKeyboardButton(
+            "➕ منتج جديد", callback_data=f"act:product_add:{oid}")])
+        rows.append([InlineKeyboardButton(
+            "◀️ المنتجات", callback_data="menu:products")])
+        await _reply(update, "💊 *المنتجات*:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "product"] and len(parts) == 4:
+        oid, pid = int(parts[2]), int(parts[3])
+        prods = {p["id"]: p for p in products_svc.list_products(
+            data_dir, actor, office_id=oid, active_only=False)}
+        p = prods.get(pid)
+        if p is None:
+            raise DomainError("المنتج غير موجود")
+        lines = ["💊 *المنتج*",
+                 f"الاسم التجاري: {p['trade_name']}",
+                 f"الاسم العلمي: {p['scientific_name'] or '—'}",
+                 f"الشركة المصنعة: {p['manufacturer'] or '—'}",
+                 f"الحالة: {p['status']}"]
+        await _reply(update, "\n".join(lines),
+                     keyboards.product_detail_keyboard(
+                         oid, pid, p["status"] == "active"))
+        return True
+
+    if parts[:2] == ["act", "product_toggle"] and len(parts) == 4:
+        oid, pid = int(parts[2]), int(parts[3])
+        prods = {p["id"]: p for p in products_svc.list_products(
+            data_dir, actor, office_id=oid, active_only=False)}
+        p = prods.get(pid)
+        if p is None:
+            raise DomainError("المنتج غير موجود")
+        verb = "تعطيل" if p["status"] == "active" else "تفعيل"
+        await _reply(update, f"❓ {verb} المنتج *{p['trade_name']}*؟",
+                     keyboards.confirm_keyboard(
+                         f"act:product_toggle_yes:{oid}:{pid}",
+                         f"menu:product:{oid}:{pid}"))
+        return True
+
+    if parts[:2] == ["act", "product_toggle_yes"] and len(parts) == 4:
+        oid, pid = int(parts[2]), int(parts[3])
+        prods = {p["id"]: p for p in products_svc.list_products(
+            data_dir, actor, office_id=oid, active_only=False)}
+        p = prods.get(pid)
+        if p is None:
+            raise DomainError("المنتج غير موجود")
+        out = products_svc.set_product_status(
+            data_dir, actor, office_id=oid, product_id=pid,
+            active=(p["status"] != "active"))
+        await _reply(update, f"✅ أصبح المنتج: {out['status']}.",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "product_add"] and len(parts) == 3:
+        oid = int(parts[2])
+        _set_flow(context, "product_add", "trade_name", {"oid": oid})
+        await _reply(update, "💊 أرسل الاسم التجاري للمنتج:",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "product_add_yes"] and len(parts) == 3:
+        oid = int(parts[2])
+        pending = context.user_data.pop("pending_product", None) or {}
+        out = products_svc.create_product(
+            data_dir, actor, office_id=oid,
+            trade_name=pending.get("trade_name", ""),
+            scientific_name=pending.get("scientific_name", ""))
+        await _reply(update, f"💊 تم إنشاء المنتج: {out['trade_name']}",
+                     keyboards.back_to_main())
+        return True
+
+    # ---- surveys ----
+    if data == "menu:surveys":
+        with dbm.identity_session(data_dir) as s:
+            offices = s.query(im.Office).order_by(im.Office.id).all()
+        await _reply(update, "📝 اختر المكتب:",
+                     keyboards.offices_pick("menu:surveys_off", offices))
+        return True
+
+    if parts[:2] == ["menu", "surveys_off"] and len(parts) == 3:
+        oid = int(parts[2])
+        svs = surveys_svc.list_surveys(data_dir, actor, office_id=oid,
+                                       active_only=False)
+        rows = []
+        for sv in svs[:20]:
+            mark = {"draft": "📝", "active": "✅", "closed": "⏹️"}.get(
+                sv["status"], "•")
+            rows.append([InlineKeyboardButton(
+                f"{mark} {sv['title']} ({sv['status']})",
+                callback_data=f"menu:survey:{oid}:{sv['survey_id']}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("لا توجد استبيانات",
+                                              callback_data="menu:surveys")])
+        rows.append([InlineKeyboardButton("◀️ الاستبيانات",
+                                          callback_data="menu:surveys")])
+        await _reply(update, "📝 *الاستبيانات*:", InlineKeyboardMarkup(rows))
+        return True
+
+    if parts[:2] == ["menu", "survey"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        res = surveys_svc.survey_results(data_dir, actor, office_id=oid,
+                                         survey_id=sid)
+        svs = {s["survey_id"]: s for s in surveys_svc.list_surveys(
+            data_dir, actor, office_id=oid, active_only=False)}
+        status = svs.get(sid, {}).get("status", "")
+        lines = [f"📝 *{res['title']}*",
+                 f"الحالة: {status or '—'}",
+                 f"الأسئلة: {len(res['questions'])}"]
+        for q in res["questions"][:10]:
+            lines.append(f"• {q['text']} — {q['responses']} إجابات")
+        await _reply(update, "\n".join(lines),
+                     keyboards.survey_detail_keyboard(oid, sid, status))
+        return True
+
+    if parts[:2] == ["act", "survey_activate"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        await _reply(update, "▶️ تفعيل هذا الاستبيان؟ _سيصبح متاحًا للتعبئة._",
+                     keyboards.confirm_keyboard(
+                         f"act:survey_activate_yes:{oid}:{sid}",
+                         f"menu:survey:{oid}:{sid}"))
+        return True
+
+    if parts[:2] == ["act", "survey_activate_yes"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        out = surveys_svc.set_survey_status(data_dir, actor, office_id=oid,
+                                            survey_id=sid, status="active")
+        await _reply(update, f"✅ تم تفعيل الاستبيان ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["act", "survey_close"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        await _reply(update, "⏹️ إغلاق هذا الاستبيان؟ _لن تُقبل إجابات جديدة._",
+                     keyboards.confirm_keyboard(
+                         f"act:survey_close_yes:{oid}:{sid}",
+                         f"menu:survey:{oid}:{sid}"))
+        return True
+
+    if parts[:2] == ["act", "survey_close_yes"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        out = surveys_svc.set_survey_status(data_dir, actor, office_id=oid,
+                                            survey_id=sid, status="closed")
+        await _reply(update, f"⏹️ تم إغلاق الاستبيان ({out['status']}).",
+                     keyboards.back_to_main())
+        return True
+
+    if parts[:2] == ["menu", "survey_results"] and len(parts) == 4:
+        oid, sid = int(parts[2]), int(parts[3])
+        res = surveys_svc.survey_results(data_dir, actor, office_id=oid,
+                                         survey_id=sid)
+        lines = [f"📊 *نتائج: {res['title']}*", ""]
+        for q in res["questions"]:
+            lines.append(f"❓ {q['text']} ({q['responses']} إجابات)")
+            if q["qtype"] == "rating" and q.get("average") is not None:
+                lines.append(f"   المتوسط: {q['average']:.1f}")
+            for opt, cnt in (q.get("counts") or {}).items():
+                lines.append(f"   • {opt}: {cnt}")
+        await _reply(update, "\n".join(lines), keyboards.back_to_main())
         return True
 
     # ---- company / office / user ----

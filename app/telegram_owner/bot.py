@@ -46,9 +46,11 @@ def main() -> None:
     logger.info("owner bot starting (data_dir configured, polling)")
     # Scheduled jobs (reminders) tick alongside the bot. The runner is
     # idempotent: a second start returns the running scheduler instead of
-    # double-ticking. Delivery is LoggingNotifier until real Telegram
-    # sending is wired and tested — see app/jobs/runner.py.
-    job_runner.start_runner(data_dir)
+    # double-ticking. Delivery mode comes from REMINDER_DELIVERY
+    # ("log" default = no real sends; "telegram" = real sends via
+    # TelegramNotifier, operator opt-in only).
+    from app.jobs.telegram_notifier import build_default_notifier
+    job_runner.start_runner(data_dir, build_default_notifier(data_dir))
     try:
         app.run_polling(allowed_updates=["message", "callback_query"])
     finally:
