@@ -1,0 +1,20 @@
+[Unit]
+Description=Medical Rep Owner Bot + reminder scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# عدّل المسارات حسب جهازك:
+User=medrep
+WorkingDirectory=/opt/medical-rep-system
+Environment=MEDREP_DATA_DIR=/opt/medical-rep-system/data
+ExecStart=/opt/medical-rep-system/.venv/bin/python scripts/run_owner_bot.py
+Restart=always
+RestartSec=10
+# لا تُسجَّل الأسرار: البوت نفسه لا يطبع التوكن أبدًا
+StandardOutput=append:/var/log/medrep/bot.log
+StandardError=append:/var/log/medrep/bot.log
+
+[Install]
+WantedBy=multi-user.target

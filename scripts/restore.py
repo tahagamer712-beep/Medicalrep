@@ -24,13 +24,19 @@ parser = argparse.ArgumentParser()
 g = parser.add_mutually_exclusive_group(required=True)
 g.add_argument("--office-id", type=int)
 g.add_argument("--identity", action="store_true")
-parser.add_argument("--file", type=str, required=True)
+g.add_argument("--manifest", type=str,
+               help="restore a full backup set from a manifest file")
+parser.add_argument("--file", type=str, required=False)
 parser.add_argument("--confirm", action="store_true")
 args = parser.parse_args()
 
 data_dir = Path(os.environ.get("MEDREP_DATA_DIR", "./data"))
 
-if args.identity:
+if args.manifest:
+    result = dbm.restore_backup_set(data_dir, Path(args.manifest),
+                                     confirm=args.confirm)
+    print(f"restored set: {result['restored']}")
+elif args.identity:
     dst = dbm.restore_identity(data_dir, Path(args.file),
                                confirm=args.confirm)
     print(f"restored identity from {args.file} -> {dst}")
