@@ -2,8 +2,10 @@
 from fastapi import FastAPI
 
 from app.config import settings
+from app.whatsapp.webhook import router as whatsapp_router
 
 app = FastAPI(title="Medical Rep Management System")
+app.include_router(whatsapp_router)
 
 
 @app.get("/health")

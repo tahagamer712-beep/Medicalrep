@@ -26,6 +26,7 @@ from app.core.permissions import require_permission
 from app.core.time_utils import utcnow
 from app.databases import manager as dbm
 from app.databases import office_models as om
+from app.services import attachments as attach_svc
 from app.identity import models as im
 from app.services.audit import log_office_event
 
@@ -188,8 +189,14 @@ def set_tgt_products(data_dir: Path, actor: int, *, office_id: int,
 def add_field_survey(data_dir: Path, actor: int, *, office_id: int,
                      doctor_id: int, products_prices: list | None = None,
                      competitors: list | None = None,
-                     market_notes: str = "") -> dict:
-    """Time-varying market data. Append-only; last update shown on profile."""
+                     market_notes: str = "",
+                     product_items: list | None = None) -> dict:
+    """Time-varying market data. Append-only; last update shown on profile.
+
+    product_items: [{"product_id": int, "price": str}] — structured links to
+    the catalog. Each product must exist in this office and be active.
+    The legacy free-text products_prices list is kept as-is.
+    """
     with dbm.identity_session(data_dir) as s:
         _require_manage(s, actor, office_id)
     with dbm.office_session(data_dir, office_id) as osess:
@@ -204,7 +211,44 @@ def add_field_survey(data_dir: Path, actor: int, *, office_id: int,
             market_notes=market_notes)
         osess.add(fs)
         osess.flush()
-        return {"survey_id": fs.id, "recorded_at": fs.recorded_at.isoformat()}
+        linked: list[dict] = []
+        for it in product_items or []:
+            try:
+                pid = int(it["product_id"])
+            except (KeyError, TypeError, ValueError):
+                raise ValidationError("each item needs an integer product_id")
+            p = osess.get(om.Product, pid)
+            if p is None:
+                raise NotFound(f"product {pid} not found in this office")
+            if p.status != "active":
+                raise ValidationError(f"product {pid} is not active")
+            row = om.FieldSurveyProduct(
+                field_survey_id=fs.id, product_id=pid,
+                price=str(it.get("price", "")), added_by=actor)
+            osess.add(row)
+            linked.append({"product_id": pid, "trade_name": p.trade_name,
+                           "price": row.price})
+        osess.flush()
+        return {"survey_id": fs.id, "recorded_at": fs.recorded_at.isoformat(),
+                "linked_products": linked}
+
+
+def list_field_survey_products(data_dir: Path, actor: int, *, office_id: int,
+                               survey_id: int) -> list[dict]:
+    """Structured catalog product prices for a field survey."""
+    with dbm.identity_session(data_dir) as s:
+        _require_manage(s, actor, office_id)
+    with dbm.office_session(data_dir, office_id) as osess:
+        fs = osess.get(om.DoctorFieldSurvey, survey_id)
+        if fs is None:
+            raise NotFound("field survey not found")
+        rows = (osess.query(om.FieldSurveyProduct, om.Product)
+                .join(om.Product,
+                      om.FieldSurveyProduct.product_id == om.Product.id)
+                .filter(om.FieldSurveyProduct.field_survey_id == survey_id)
+                .order_by(om.FieldSurveyProduct.id).all())
+        return [{"product_id": p.id, "trade_name": p.trade_name,
+                 "price": fsp.price} for fsp, p in rows]
 
 
 def get_doctor(data_dir: Path, actor: int, *, office_id: int,
@@ -227,6 +271,10 @@ def get_doctor(data_dir: Path, actor: int, *, office_id: int,
         history = (osess.query(om.DoctorHistory)
                    .filter_by(doctor_id=doctor_id)
                    .order_by(om.DoctorHistory.id.desc()).limit(50).all())
+        atts = (osess.query(om.Attachment)
+                .filter_by(owner_type="doctor", owner_id=doctor_id,
+                           deleted=False)
+                .order_by(om.Attachment.id).all())
         return {
             "id": d.id, "external_code": d.external_code, "name": d.name,
             "area": d.area, "sub_area": d.sub_area,
@@ -239,6 +287,7 @@ def get_doctor(data_dir: Path, actor: int, *, office_id: int,
             "dealer_info": d.dealer_info, "assigned_rep_id": d.assigned_rep_id,
             "status": d.status, "version": d.version,
             "tgt_products": tgt,
+            "attachments": [attach_svc._to_dict(a) for a in atts],
             "last_survey": ({
                 "by": last_survey.rep_id,
                 "at": last_survey.recorded_at.isoformat(),
