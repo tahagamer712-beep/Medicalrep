@@ -143,7 +143,7 @@ def test_upgrade_v3_to_v6_preserves_doctors_and_backfills_codes(seed):
     _downgrade_to_v3(d, oid)
     assert _version(d, oid) == 3
     v = dbm.migrate_office_db(d, oid)
-    assert v == om.OFFICE_SCHEMA_VERSION == 6
+    assert v == om.OFFICE_SCHEMA_VERSION
 
     with dbm.office_session(d, oid) as s:
         doc = s.get(om.Doctor, out["id"])
@@ -157,3 +157,96 @@ def test_upgrade_v3_to_v6_preserves_doctors_and_backfills_codes(seed):
         # v4/v5 tables restored too
         assert s.query(om.Product).count() >= 0
         assert s.query(om.FinancialTransaction).count() == 0
+
+
+def _downgrade_to_v6(data_dir, office_id):
+    """Simulate a v6 office file: attachments table without v7 columns."""
+    import sqlite3
+    path = dbm.office_db_path(data_dir, office_id)
+    dbm._drop_engine(path)
+    conn = sqlite3.connect(path)
+    try:
+        # rebuild attachments without the v7 columns
+        conn.execute("DROP TABLE IF EXISTS attachments;")
+        conn.execute("""CREATE TABLE attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_type VARCHAR(30), owner_id INTEGER,
+            file_name VARCHAR(160), stored_path VARCHAR(255),
+            mime VARCHAR(80) DEFAULT '', size_bytes INTEGER DEFAULT 0,
+            uploaded_by INTEGER DEFAULT 0,
+            uploaded_at DATETIME)""")
+        conn.execute("CREATE INDEX ix_attachments_owner_type ON attachments (owner_type);")
+        conn.execute("CREATE INDEX ix_attachments_owner_id ON attachments (owner_id);")
+        conn.execute("INSERT INTO attachments (owner_type, owner_id, file_name, stored_path) "
+                     "VALUES ('visit', 1, 'old.png', '/tmp/old.png');")
+        conn.execute("UPDATE schema_version SET version = 6;")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_upgrade_v6_to_v7_adds_soft_delete_columns(seed):
+    d = seed["data_dir"]
+    oid = seed["office1"]
+    _downgrade_to_v6(d, oid)
+    assert _version(d, oid) == 6
+    v = dbm.migrate_office_db(d, oid)
+    assert v == om.OFFICE_SCHEMA_VERSION == 8
+    with dbm.office_session(d, oid) as s:
+        row = s.query(om.Attachment).filter_by(file_name="old.png").one()
+        assert row.deleted is False  # backfilled default
+        assert row.deleted_at is None
+        assert row.size_bytes == 0
+    # idempotent: second run is a no-op
+    assert dbm.migrate_office_db(d, oid) == 8
+
+
+def test_upgrade_v7_to_v8_adds_product_link_tables(seed):
+    """Simulate a v7 office file (no visit_products/field_survey_products),
+    migrate to v8, verify old data preserved and new tables usable."""
+    import sqlite3
+    d = seed["data_dir"]
+    oid = seed["office1"]
+    path = dbm.office_db_path(d, oid)
+    dbm._drop_engine(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE IF EXISTS visit_products;")
+        conn.execute("DROP TABLE IF EXISTS field_survey_products;")
+        # keep a legacy visit with free-text products
+        conn.execute(
+            "INSERT INTO actual_visits (representative_id, target_type, "
+            "target_id, visited_at, visit_type, outcome, notes, "
+            "products_json, created_by, source, status, created_at) VALUES "
+            "(1, 'doctor', 1, '2026-10-01T10:00:00', 'routine', 'done', "
+            "'زيارة قديمة', '[\"أسبرين\"]', 1, 'manual', 'active', "
+            "'2026-10-01T10:00:00');")
+        conn.execute("UPDATE schema_version SET version = 7;")
+        conn.commit()
+    finally:
+        conn.close()
+    v = dbm.migrate_office_db(d, oid)
+    assert v == om.OFFICE_SCHEMA_VERSION == 8
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("INSERT INTO products (trade_name, scientific_name, "
+                     "manufacturer, dosage_form, strength, status, created_by,"
+                     " created_at, updated_at) VALUES ('دواء', 'علمي', '', '',"
+                     " '', 'active', 1, '2026-10-01', '2026-10-01');")
+        conn.commit()
+    finally:
+        conn.close()
+    dbm._drop_engine(path)
+    with dbm.office_session(d, oid) as s:
+        import json
+        visit = s.query(om.ActualVisit).filter_by(notes="زيارة قديمة").one()
+        assert json.loads(visit.products_json) == ["أسبرين"]  # preserved
+        prod = s.query(om.Product).filter_by(trade_name="دواء").one()
+        # new tables exist and accept rows
+        s.add(om.VisitProduct(visit_id=visit.id, product_id=prod.id,
+                              quantity=3))
+    with dbm.office_session(d, oid) as s:
+        rows = s.query(om.VisitProduct).filter_by(visit_id=visit.id).all()
+        assert len(rows) == 1 and rows[0].quantity == 3
+    # idempotent
+    assert dbm.migrate_office_db(d, oid) == 8
