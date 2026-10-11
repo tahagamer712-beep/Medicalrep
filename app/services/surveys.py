@@ -17,7 +17,7 @@ from app.databases import office_models as om
 from app.identity import models as im
 from app.services.audit import log_office_event
 
-QTYPES = ("text", "single_choice", "rating")
+QTYPES = ("text", "single_choice", "rating", "product_select")
 
 
 def create_survey(data_dir: Path, actor: int, *, office_id: int, title: str,
@@ -117,7 +117,7 @@ def submit_response(data_dir: Path, actor: int, *, office_id: int,
         if osess.query(om.SurveyResponse).filter_by(
                 survey_id=survey_id, respondent_id=actor).first():
             raise AlreadyExists("already responded to this survey")
-        _validate_answers(questions, answers)
+        _validate_answers(osess, questions, answers)
         resp = om.SurveyResponse(survey_id=survey_id, respondent_id=actor)
         osess.add(resp)
         osess.flush()
@@ -131,7 +131,7 @@ def submit_response(data_dir: Path, actor: int, *, office_id: int,
         return {"response_id": resp.id}
 
 
-def _validate_answers(questions: list, answers: dict) -> None:
+def _validate_answers(osess, questions: list, answers: dict) -> None:
     for q in questions:
         val = answers.get(q.id)
         if q.required and val in (None, "", []):
@@ -145,6 +145,19 @@ def _validate_answers(questions: list, answers: dict) -> None:
         elif q.qtype == "rating":
             if not isinstance(val, int) or not 1 <= val <= 5:
                 raise ValidationError(f"rating must be 1-5 for question {q.id}")
+        elif q.qtype == "product_select":
+            pids = val if isinstance(val, list) else [val]
+            if not pids or not all(isinstance(x, int) for x in pids):
+                raise ValidationError(
+                    f"product_select needs product id(s) for question {q.id}")
+            for pid in pids:
+                prod = osess.get(om.Product, pid)
+                if prod is None:
+                    raise NotFound(
+                        f"product {pid} not found for question {q.id}")
+                if prod.status != "active":
+                    raise ValidationError(
+                        f"product {pid} is not active for question {q.id}")
 
 
 def survey_results(data_dir: Path, actor: int, *, office_id: int,
@@ -173,6 +186,15 @@ def survey_results(data_dir: Path, actor: int, *, office_id: int,
                 for v in vals:
                     counts[str(v)] = counts.get(str(v), 0) + 1
                 summary["counts"] = counts
+            elif q.qtype == "product_select":
+                counts = {}
+                for v in vals:
+                    pids = v if isinstance(v, list) else [v]
+                    for pid in pids:
+                        prod = osess.get(om.Product, pid)
+                        name = prod.trade_name if prod else f"#{pid}"
+                        counts[name] = counts.get(name, 0) + 1
+                summary["counts"] = counts
             else:
                 summary["answers"] = vals
             out["questions"].append(summary)
@@ -185,7 +207,12 @@ def list_surveys(data_dir: Path, actor: int, *, office_id: int,
         m = (s.query(im.Membership)
              .filter_by(user_id=actor, office_id=office_id, status="active").first())
         if m is None:
-            raise PermissionDenied("no active membership in this office")
+            # global owner may read everything (mirrors require_permission)
+            owner = (s.query(im.Membership)
+                     .filter_by(user_id=actor, role="owner",
+                                status="active").first())
+            if owner is None:
+                raise PermissionDenied("no active membership in this office")
     with dbm.office_session(data_dir, office_id) as osess:
         q = osess.query(om.Survey).order_by(om.Survey.id.desc())
         if active_only:

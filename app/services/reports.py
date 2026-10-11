@@ -1,9 +1,11 @@
-"""Reports: daily / weekly / monthly + rep performance + Excel/CSV export.
+"""Reports: daily / weekly / monthly + rep performance + Excel/CSV/PDF export.
 
-- Reports are READ models built from the office DB; Excel/CSV are export
+- Reports are READ models built from the office DB; Excel/CSV/PDF are export
   formats only, never a source of truth.
 - Supervisor+ sees the whole office; a rep sees only their own rows.
 - Dates are interpreted in the OFFICE timezone (Asia/Baghdad default).
+- PDF export shapes Arabic (RTL) with arabic_reshaper + python-bidi and
+  embeds Noto Sans Arabic (bundled under app/services/fonts, OFL licensed).
 """
 from __future__ import annotations
 
@@ -12,6 +14,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import arabic_reshaper
+from bidi.algorithm import get_display
+from fpdf import FPDF
 from openpyxl import Workbook
 
 from app.core.errors import NotFound, PermissionDenied, ValidationError
@@ -307,4 +312,109 @@ def export_excel(report: dict, out_path: str | Path) -> Path:
         for k, v in totals.items():
             ws.append([k, v])
     wb.save(out_path)
+    return out_path
+
+
+# --- PDF export (Arabic RTL) ---------------------------------------------------
+# fpdf2 does no complex text layout, so Arabic is shaped up-front with
+# arabic_reshaper + python-bidi. Columns are rendered right-to-left.
+
+_FONTS_DIR = Path(__file__).parent / "fonts"
+
+
+def _pdf_font_paths() -> tuple[str, str, str, str]:
+    """(arabic_regular, arabic_bold, latin_regular, latin_bold).
+
+    Bundled Noto Sans Arabic has no Latin glyphs, so DejaVu Sans is the
+    fallback for Latin/digits/punctuation. System paths are the last resort.
+    """
+    d = _FONTS_DIR
+    names = ("NotoSansArabic-Regular.ttf", "NotoSansArabic-Bold.ttf",
+             "DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+    paths = [d / n for n in names]
+    if all(p.exists() for p in paths):
+        return tuple(str(p) for p in paths)
+    sys_dir = Path("/usr/share/fonts/truetype")
+    return (str(sys_dir / "noto" / names[0]),
+            str(sys_dir / "noto" / names[1]),
+            str(sys_dir / "dejavu" / "DejaVuSans.ttf"),
+            str(sys_dir / "dejavu" / "DejaVuSans-Bold.ttf"))
+
+
+def _ar(text) -> str:
+    """Shape text for PDF rendering (Arabic RTL + Latin/digits mixing)."""
+    return get_display(arabic_reshaper.reshape(str(text)))
+
+
+class _ReportPDF(FPDF):
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("ar", "", 8)
+        self.cell(0, 10, _ar(f"صفحة {self.page_no()} من {{nb}}"), align="C")
+
+
+def export_pdf(report: dict, out_path: str | Path) -> Path:
+    """Render the same report dict used by export_csv/export_excel to PDF."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pdf = _ReportPDF(orientation="L", format="A4")
+    pdf.alias_nb_pages("{nb}")
+    pdf.set_auto_page_break(True, margin=18)
+    ar_reg, ar_bold, lat_reg, lat_bold = _pdf_font_paths()
+    pdf.add_font("ar", "", ar_reg)
+    pdf.add_font("ar", "B", ar_bold)
+    pdf.add_font("lat", "", lat_reg)
+    pdf.add_font("lat", "B", lat_bold)
+    pdf.set_fallback_fonts(["ar", "lat"])
+
+    pdf.add_page()
+    pdf.set_font("ar", "B", 14)
+    pdf.cell(0, 11, _ar(report.get("title", "")), align="C",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("ar", "", 9)
+    pdf.cell(0, 7, _ar(f"أُنشئ في: {report.get('generated_at', '')}"),
+             align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    rows = report.get("rows", [])
+    if not rows:
+        pdf.set_font("ar", "", 11)
+        pdf.cell(0, 10, _ar("لا توجد بيانات"), align="C")
+    else:
+        cols = list(rows[0].keys())
+        rcols = cols[::-1]  # visual RTL order: first column at the right
+        usable = pdf.w - pdf.l_margin - pdf.r_margin
+        col_w = usable / len(rcols)
+        pdf.set_font("ar", "B", 9)
+        for i, c in enumerate(rcols):
+            x = pdf.l_margin + i * col_w
+            pdf.set_xy(x, pdf.get_y())
+            pdf.cell(col_w, 8, _ar(c), border=1, align="C")
+        pdf.ln()
+        pdf.set_font("ar", "", 8)
+        for r in rows:
+            y = pdf.get_y()
+            if y > pdf.h - 26:  # keep room for footer
+                pdf.add_page()
+                y = pdf.get_y()
+            for i, c in enumerate(rcols):
+                pdf.set_xy(pdf.l_margin + i * col_w, y)
+                pdf.cell(col_w, 7, _ar(r.get(c, "")), border=1, align="C")
+            pdf.set_y(y + 7)
+
+    totals = report.get("totals", {})
+    if totals:
+        pdf.ln(4)
+        if pdf.get_y() > pdf.h - 30:
+            pdf.add_page()
+        pdf.set_font("ar", "B", 10)
+        pdf.cell(0, 8, _ar("الإجمالي"), align="R",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("ar", "", 9)
+        for k, v in totals.items():
+            pdf.cell(0, 6, _ar(f"{k}: {v}"), align="R",
+                     new_x="LMARGIN", new_y="NEXT")
+
+    pdf.output(str(out_path))
     return out_path

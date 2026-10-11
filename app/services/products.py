@@ -22,7 +22,13 @@ def _require_member(isess: Session, actor: int, office_id: int) -> None:
     m = (isess.query(im.Membership)
          .filter_by(user_id=actor, office_id=office_id, status="active").first())
     if m is None:
-        raise PermissionDenied("no active membership in this office")
+        # global owner (no office-scoped membership) may read everything,
+        # mirroring require_permission's owner-grants-everything rule
+        owner = (isess.query(im.Membership)
+                 .filter_by(user_id=actor, role="owner",
+                            status="active").first())
+        if owner is None:
+            raise PermissionDenied("no active membership in this office")
 
 
 def create_unit(data_dir: Path, actor: int, *, office_id: int, name: str,
